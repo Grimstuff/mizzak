@@ -1,0 +1,7 @@
+venv/
+configs/
+__pycache__/
+secrets.json
+config.json
+guild_settings.json
+TODO

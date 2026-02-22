@@ -1,0 +1,5 @@
+- Make admin commands secret
+- playlists
+- spotify
+- avatar
+- move configs to config folder, individualized files

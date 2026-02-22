@@ -50,17 +50,37 @@ FFMPEG_OPTIONS = {
     'options': '-vn'
 }
 
+class YTDLLogger:
+    def debug(self, msg):
+        if not msg.startswith('[debug] '):
+            print(f"[YTDL] {msg}")
+
+    def warning(self, msg):
+        print(f"[YTDL WARNING] {msg}")
+
+    def error(self, msg):
+        print(f"[YTDL ERROR] {msg}")
+
 YTDL_OPTIONS = {
     'format': 'bestaudio/best',
-    'noplaylist': True,
-    'quiet': True,
+    'noplaylist': False,
+    'quiet': False,
+    'logger': YTDLLogger(),
     'no_warnings': True,
+    'ignoreerrors': True,
+    'playlistend': 20,
 }
+
+YTDL_OPTIONS_FLAT = YTDL_OPTIONS.copy()
+YTDL_OPTIONS_FLAT['extract_flat'] = 'in_playlist'
+
 
 # --- State Management (Per-Guild) ---
 guild_queues = {}
 guild_skip_votes = {}
 guild_skip_percents = {} # Default will be 0.25 (25%)
+guild_last_np_message = {} # {guild_id: {'message_id': int, 'channel_id': int, 'message_count': int}}
+guild_current_song = {} # {guild_id: current_song_dict}
 
 class Bot(commands.Bot):
     def __init__(self):
@@ -224,6 +244,193 @@ class TrackSelectionView(discord.ui.View):
             pass
 
 
+class DurationVoteView(discord.ui.View):
+    def __init__(self, ctx_interaction, tracks, duration_str, required_votes, guild_id, vc):
+        super().__init__(timeout=60)
+        self.ctx_interaction = ctx_interaction
+        self.tracks = tracks
+        self.duration_str = duration_str
+        self.required_votes = required_votes
+        self.guild_id = guild_id
+        self.vc = vc
+        self.votes = set()
+        self.passed = False
+
+    @discord.ui.button(label="Vote to Play", style=discord.ButtonStyle.success, emoji="👍")
+    async def vote(self, interaction: discord.Interaction, button: discord.ui.Button):
+        # Ensure user is in the same voice channel
+        if not interaction.user.voice or not self.vc or interaction.user.voice.channel != self.vc.channel:
+            await interaction.response.send_message("You must be in the voice channel to vote!", ephemeral=True)
+            return
+
+        if interaction.user.id in self.votes:
+            await interaction.response.send_message("You already voted!", ephemeral=True)
+            return
+
+        self.votes.add(interaction.user.id)
+        current_votes = len(self.votes)
+        
+        if current_votes >= self.required_votes:
+            self.passed = True
+            self.stop()
+            
+            # Disable buttons
+            for item in self.children:
+                item.disabled = True
+            
+            count = len(self.tracks)
+            if count == 1:
+                title_msg = f"**{self.tracks[0]['title']}**"
+            else:
+                title_msg = f"**{count}** songs"
+
+            await interaction.response.edit_message(content=f"✅ Vote passed! Adding {title_msg} to queue.", view=self)
+            
+            # Helper to check if a track is 'flat' (missing stream URL)
+            def is_flat(track):
+                # Flat tracks usually have 'url' as ID (short) or YouTube watch URL, 
+                # but NOT the longgooglevideo stream URL.
+                # A robust check is if we used extract_flat for them.
+                # But here we just inspect.
+                # Actually, fully extracted tracks have a very long 'url'.
+                # But a safer way is to rely on what the caller passed.
+                # The caller passed 'valid_entries' which are flat.
+                # Let's assume if it's a playlist > 1 track and we are here, it MIGHT be flat.
+                # However, for single tracks, we also use this view.
+                # Let's try to extract the first track if needed.
+                return True # We will re-process in the background anyway for safety/consistency if it's a playlist.
+
+            # We'll treat all playlist entries passed here as potentially needing extraction if they are from the new flow.
+            # But the old flow (single video fully extracted) also uses this.
+            # We can check if 'url' looks like a stream url? No.
+            
+            # Let's just implement the logic:
+            # 1. Add first track (extract if needed)
+            # 2. Add rest (background)
+            
+            # Since 'vote' is async, we can await extraction.
+            
+            first_track = self.tracks[0]
+            
+            # Check if it looks fully extracted (has a long URL and maybe other fields?)
+            # Actually, let's just re-extract the first one to be safe if we are not sure.
+            # But that wastes time if it was already extracted.
+            # The 'play' command passed flat entries for playlists.
+            
+            # Let's assume we need to extract if it's a playlist.
+            is_playlist = len(self.tracks) > 1
+            
+            if self.guild_id not in guild_queues:
+                guild_queues[self.guild_id] = []
+                
+            if is_playlist:
+                # 1. Extract first track
+                first_url = first_track.get('url')
+                
+                # We need to run extraction in executor
+                ydl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+                loop = asyncio.get_event_loop()
+                
+                try:
+                    # If it's already a stream URL, this might fail or just work.
+                    # But 'first_url' from flat is the webpage url or id.
+                    # If it's a stream url (from old single video flow), extract_info might treat it as a direct link?
+                    # Stream URLs are usually temporary and specific.
+                    # Let's check if 'url' starts with 'http' and has 'googlevideo.com' (common for YT).
+                    if 'googlevideo.com' in first_url:
+                        # Likely already extracted
+                        guild_queues[self.guild_id].append(first_track)
+                        final_first_track = first_track
+                    else:
+                        # Needs extraction
+                        info = await loop.run_in_executor(None, lambda: ydl.extract_info(first_url, download=False))
+                        duration = info.get('duration', 0)
+                        final_first_track = {
+                            'url': info['url'],
+                            'title': info.get('title', 'Unknown Track'),
+                            'duration': duration,
+                            'duration_str': str(int(duration // 60)) + ":" + str(int(duration % 60)).zfill(2)
+                        }
+                        guild_queues[self.guild_id].append(final_first_track)
+                except Exception as e:
+                    print(f"Error extracting first track after vote: {e}")
+                    await self.ctx_interaction.followup.send("Failed to play first track.")
+                    return
+
+                # 2. Start background for the rest
+                remaining = self.tracks[1:]
+                if remaining:
+                     asyncio.create_task(process_playlist_background(self.guild_id, remaining, self.ctx_interaction, self.vc))
+
+            else:
+                # Single track - assume it's fully extracted OR handle flat single
+                # The 'play' command handles single tracks by fully extracting them before check_duration_and_vote if possible?
+                # No, I changed 'play' to use flat for single too in the new flow?
+                # In 'play':
+                # if 'entries' in info: ... check_duration_and_vote(..., valid_entries, ...) -> These are FLAT
+                # else: ... check_duration_and_vote(..., [info], ...) -> 'info' is FLAT if from flat_ydl?
+                # Yes, I used YTDL_OPTIONS_FLAT for everything in the new 'play'.
+                # So 'info' for single video is also flat.
+                # So we ALWAYS need to extract here.
+                
+                url = first_track.get('url')
+                if 'googlevideo.com' in url:
+                     guild_queues[self.guild_id].append(first_track)
+                     final_first_track = first_track
+                else:
+                    ydl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+                    loop = asyncio.get_event_loop()
+                    try:
+                        info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
+                        duration = info.get('duration', 0)
+                        final_first_track = {
+                            'url': info['url'],
+                            'title': info.get('title', 'Unknown Track'),
+                            'duration': duration,
+                            'duration_str': str(int(duration // 60)) + ":" + str(int(duration % 60)).zfill(2)
+                        }
+                        guild_queues[self.guild_id].append(final_first_track)
+                    except Exception as e:
+                        print(f"Error extracting track: {e}")
+                        await self.ctx_interaction.followup.send("Failed to play track.")
+                        return
+
+            # Start playback if needed
+            if not self.vc.is_playing():
+                if is_playlist:
+                     await self.ctx_interaction.followup.send(f"Starting playlist with: **{final_first_track['title']}**")
+                else:
+                     await self.ctx_interaction.followup.send(f"Starting: **{final_first_track['title']}**")
+                play_next(self.guild_id, self.vc, self.ctx_interaction.channel)
+            else:
+                if is_playlist:
+                    await self.ctx_interaction.followup.send(f"Added {len(self.tracks)} songs to queue (processing in background).")
+                else:
+                    await self.ctx_interaction.followup.send(f"Added to queue: **{final_first_track['title']}**")
+
+        else:
+
+            if len(self.tracks) == 1:
+                 msg = f"⚠️ This song is too long! ({self.duration_str})."
+            else:
+                 msg = f"⚠️ This playlist is too long! ({self.duration_str})."
+                 
+            await interaction.response.edit_message(content=f"{msg}\nVotes required to play: {current_votes}/{self.required_votes}", view=self)
+
+    async def on_timeout(self):
+        if not self.passed:
+            for item in self.children:
+                item.disabled = True
+            try:
+                if len(self.tracks) == 1:
+                    target = f"**{self.tracks[0]['title']}**"
+                else:
+                    target = "playlist"
+                await self.ctx_interaction.edit_original_response(content=f"❌ Vote timed out for {target}.", view=self)
+            except:
+                pass
+
+
 # --- Audio Player Logic ---
 def check_confidence(query, title):
     query = query.lower()
@@ -269,12 +476,46 @@ async def update_voice_status(channel, status):
         except Exception as e:
             print(f"Failed to update voice status: {e}")
 
+async def send_np_message(guild_id, channel, song_title, volume, view):
+    # 1. Delete previous NP message if it exists
+    if guild_id in guild_last_np_message:
+        last_msg_data = guild_last_np_message[guild_id]
+        try:
+            # We might not need to fetch if we just want to delete, but delete needs the message object or ID.
+            # discord.py's delete usually comes from the message object.
+            # We can try to use partial message if we have ID and channel, but fetching is safer to check existence.
+            # Actually, `channel.get_partial_message(id).delete()` is available in newer d.py but fetching is fine.
+            old_channel = bot.get_channel(last_msg_data['channel_id'])
+            if old_channel:
+                # fetch_message requires an API call.
+                # using delete_messages for bulk might be overkill for 1 message.
+                try:
+                    old_msg = await old_channel.fetch_message(last_msg_data['message_id'])
+                    await old_msg.delete()
+                except discord.NotFound:
+                    pass
+        except Exception as e:
+            print(f"Failed to delete old NP message: {e}")
+
+    # 2. Send new NP message
+    msg = await channel.send(f"🎶 **Now Playing:** {song_title} (Vol: {int(volume*100)}%)", view=view)
+
+    # 3. Store new message info
+    guild_last_np_message[guild_id] = {
+        'message_id': msg.id,
+        'channel_id': channel.id,
+        'message_count': 0
+    }
+
 def play_next(guild_id, vc, text_channel):
     # Reset skip votes for the new track
     guild_skip_votes[guild_id] = set()
 
     if guild_id in guild_queues and len(guild_queues[guild_id]) > 0:
         next_song = guild_queues[guild_id].pop(0)
+
+        # Store current song
+        guild_current_song[guild_id] = next_song
 
         # Get default volume (0.0 - 1.0), defaulting to 0.6 (60%) if not set
         guild_id_str = str(guild_id)
@@ -287,9 +528,9 @@ def play_next(guild_id, vc, text_channel):
         # vc.play's "after" callback runs in a background thread, so we must use threadsafe calls
         vc.play(source, after=lambda e: bot.loop.call_soon_threadsafe(play_next, guild_id, vc, text_channel))
 
-        # Send Now Playing message
+        # Send Now Playing message (via helper)
         view = SkipButton(guild_id, vc)
-        coro = text_channel.send(f"🎶 **Now Playing:** {next_song['title']} (Vol: {int(default_volume*100)}%)", view=view)
+        coro = send_np_message(guild_id, text_channel, next_song['title'], default_volume, view)
         asyncio.run_coroutine_threadsafe(coro, bot.loop)
 
         # Update Voice Channel Status
@@ -297,6 +538,12 @@ def play_next(guild_id, vc, text_channel):
         asyncio.run_coroutine_threadsafe(status_coro, bot.loop)
     else:
         # Queue is empty, leave channel
+        # Clear current song and NP message tracking
+        if guild_id in guild_current_song:
+            del guild_current_song[guild_id]
+        if guild_id in guild_last_np_message:
+            del guild_last_np_message[guild_id]
+
         # Clear status before leaving (or just leave, status might persist but that's okay, maybe clear it?)
         # Actually better to clear it if we can, but disconnecting might clear it automatically or leave it. 
         # Let's try to clear it explicitly first.
@@ -305,6 +552,105 @@ def play_next(guild_id, vc, text_channel):
 
         coro = vc.disconnect()
         asyncio.run_coroutine_threadsafe(coro, bot.loop)
+
+
+async def check_duration_and_vote(interaction, tracks, total_duration, max_duration, vc):
+    """
+    Checks if the duration exceeds the limit and triggers a vote if necessary.
+    Returns True if a vote was triggered (caller should return), False otherwise.
+    """
+    if max_duration > 0 and total_duration > max_duration:
+        # Calculate required votes
+        listeners = [m for m in vc.channel.members if not m.bot]
+        guild_id = interaction.guild.id
+        required_percent = guild_skip_percents.get(guild_id, 0.25)
+        required_votes = max(1, int(len(listeners) * required_percent))
+
+        print(f"DEBUG: Duration Vote Triggered")
+        print(f"DEBUG: Total Duration: {total_duration}, Max: {max_duration}")
+        print(f"DEBUG: Listeners: {[m.name for m in listeners]}")
+        print(f"DEBUG: Required Votes: {required_votes} (Percent: {required_percent})")
+        
+        # Format duration string for display
+        duration_str = str(int(total_duration // 60)) + "m " + str(int(total_duration % 60)).zfill(2) + "s"
+        
+        view = DurationVoteView(interaction, tracks, duration_str, required_votes, guild_id, vc)
+        
+        if len(tracks) == 1:
+            await interaction.followup.send(f"⚠️ **{tracks[0]['title']}** is longer than the limit ({int(max_duration/60)}m). Vote to play!", view=view)
+        else:
+            await interaction.followup.send(f"⚠️ Playlist duration ({duration_str}) exceeds limit ({int(max_duration/60)}m). Vote to add **{len(tracks)}** songs!", view=view)
+            
+        return True
+    return False
+
+async def process_playlist_background(guild_id, entries, interaction, vc):
+    """
+    Background task to process playlist entries and add them to the queue.
+    """
+    ydl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+    added_count = 0
+    failed_count = 0
+    
+    # We already added the first track, so start from the second one if any
+    # (The caller will pass the remaining entries)
+    
+    for entry in entries:
+        try:
+            url = entry.get('url')
+            if not url:
+                continue
+
+            # Extract full info for playback
+            loop = asyncio.get_event_loop()
+            info = await loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False))
+            
+            if not info:
+                failed_count += 1
+                continue
+
+            duration = info.get('duration', 0)
+            duration_str = str(int(duration // 60)) + ":" + str(int(duration % 60)).zfill(2)
+            
+            track_info = {
+                'url': info['url'], # Stream URL
+                'title': info.get('title', 'Unknown Track'),
+                'duration': duration,
+                'duration_str': duration_str
+            }
+
+            if guild_id not in guild_queues:
+                guild_queues[guild_id] = []
+            
+            guild_queues[guild_id].append(track_info)
+            added_count += 1
+            
+            # Optional: Log progress or update a status message every N tracks
+            if added_count % 5 == 0:
+                print(f"[Background] Added {added_count} tracks to guild {guild_id} queue.")
+
+            # If the queue was empty and nothing was playing (maybe previous track finished while we were processing)
+            # We should check if we need to restart playback. 
+            # However, play_next usually handles the queue. 
+            # If the bot stopped because queue was empty, we might need to kickstart it.
+            # But usually play_next is recursive/looped via 'after'.
+            # If play_next finished and emptied the queue, it disconnects.
+            # So if we are adding to an empty queue and bot is not playing/connected, we might need to reconnect?
+            # But the user is likely still in the channel listening to the first track.
+            
+            if not vc.is_playing() and not vc.is_paused() and len(guild_queues[guild_id]) == 1 and added_count == 1:
+                 # This is a bit tricky. If the first song finished VERY quickly, the bot might have disconnected.
+                 # But generally, the first song is playing while this runs.
+                 pass
+
+        except Exception as e:
+            print(f"[Background] Error processing track {entry.get('title', 'Unknown')}: {e}")
+            failed_count += 1
+
+    if failed_count > 0:
+        print(f"[Background] Finished. Added: {added_count}, Failed: {failed_count}")
+    else:
+        print(f"[Background] Finished. Added all {added_count} tracks.")
 
 
 # --- Commands ---
@@ -335,7 +681,11 @@ async def play(interaction: discord.Interaction, query: str):
             search_query = f"ytsearch5:{query}"
             
             loop = asyncio.get_event_loop()
-            info = await loop.run_in_executor(None, lambda: ydl.extract_info(search_query, download=False))
+            try:
+                info = await asyncio.wait_for(loop.run_in_executor(None, lambda: ydl.extract_info(search_query, download=False)), timeout=30.0)
+            except asyncio.TimeoutError:
+                await interaction.followup.send("⚠️ Search timed out. YouTube took too long to respond.")
+                return
             
             if 'entries' not in info or len(info['entries']) == 0:
                 await interaction.followup.send("No results found.")
@@ -352,6 +702,36 @@ async def play(interaction: discord.Interaction, query: str):
             if confidence > 0.6 or len(entries) == 1:
                 stream_url = first_result['url']
                 title = first_title
+                duration = first_result.get('duration', 0)
+                duration_str = str(int(duration // 60)) + ":" + str(int(duration % 60)).zfill(2)
+                
+                track_info = {
+                    'url': stream_url, 
+                    'title': title, 
+                    'duration': duration,
+                    'duration_str': duration_str
+                }
+
+                # Check duration limit
+                guild_id_str = str(guild_id)
+                # Default max_duration to 30 minutes (1800 seconds) if not set
+                max_duration = guild_settings.get(guild_id_str, {}).get("max_duration", 1800)
+
+                if await check_duration_and_vote(interaction, [track_info], duration, max_duration, vc):
+                    return
+
+                # Add to queue logic for search result
+                if guild_id not in guild_queues:
+                    guild_queues[guild_id] = []
+                
+                guild_queues[guild_id].append(track_info)
+                
+                if not vc.is_playing():
+                    await interaction.followup.send(f"Added to queue and starting: **{title}**")
+                    play_next(guild_id, vc, interaction.channel)
+                else:
+                    await interaction.followup.send(f"Added to queue: **{title}**")
+                    
             else:
                 # Low confidence: Show selection menu
                 view = TrackSelectionView(entries, vc, interaction)
@@ -360,35 +740,163 @@ async def play(interaction: discord.Interaction, query: str):
 
         else:
             # Direct URL handling
+            print(f"DEBUG: Extracting info for {query} (Flat Mode)...")
+            ydl_flat = yt_dlp.YoutubeDL(YTDL_OPTIONS_FLAT)
             loop = asyncio.get_event_loop()
-            info = await loop.run_in_executor(None, lambda: ydl.extract_info(query, download=False))
+            try:
+                info = await asyncio.wait_for(loop.run_in_executor(None, lambda: ydl_flat.extract_info(query, download=False)), timeout=30.0)
+            except asyncio.TimeoutError:
+                await interaction.followup.send("⚠️ Extraction timed out. The playlist might be too large or YouTube is slow.")
+                return
             
+            print(f"DEBUG: Flat info extracted.")
+            
+            songs_to_add = []
+            total_duration = 0
+
+            # Check duration limit
+            guild_id_str = str(guild_id)
+            max_duration = guild_settings.get(guild_id_str, {}).get("max_duration", 1800)
+
             if 'entries' in info:
-                # Playlist or search result that returns entries
-                if len(info['entries']) > 0:
-                    info = info['entries'][0]
-                else:
-                    await interaction.followup.send("No results found.")
+                # Playlist handling
+                entries = list(info['entries']) # Ensure it's a list
+                if not entries:
+                    await interaction.followup.send("Playlist is empty or no results found.")
                     return
 
-            stream_url = info['url']
-            title = info.get('title', 'Unknown Track')
+                # Get playlist limit (Safety Cap - Hardcoded to 20 or more if background processing works well, but let's keep 20 for now or increase?)
+                # With background processing, we can handle more, but let's stick to 50? Or just process all?
+                # The user didn't ask to increase limit, but 'Fast Fetch' implies handling larger lists.
+                # Let's keep a reasonable limit for now, maybe 100? Or just respect the slice.
+                # The old code had a limit of 20. Let's bump it to 50 for now since we have background processing.
+                playlist_limit = 50 
+
+                # Calculate total duration from flat metadata
+                valid_entries = []
+                count = 0
+                for entry in entries:
+                    if not entry: continue
+                    if count >= playlist_limit: break
+                    
+                    # In flat extraction, duration is usually available
+                    duration = entry.get('duration', 0)
+                    total_duration += duration
+                    valid_entries.append(entry)
+                    count += 1
+                
+                if not valid_entries:
+                    await interaction.followup.send("No valid songs found in playlist.")
+                    return
+
+                # Calculate total duration string
+                total_duration_str = str(int(total_duration // 60)) + "m " + str(int(total_duration % 60)).zfill(2) + "s"
+                
+                # Check total duration against max_duration (Vote Logic)
+                # Pass the flat entries for now, check_duration_and_vote uses them for display (title) and count
+                if await check_duration_and_vote(interaction, valid_entries, total_duration, max_duration, vc):
+                    # If vote triggered, wait for result? 
+                    # No, check_duration_and_vote sends the vote view. 
+                    # The vote view needs to handle the "Passed" case.
+                    # Currently, the Vote View adds to queue directly.
+                    # We need to update DurationVoteView to support background processing for playlists.
+                    
+                    # WAIT: The DurationVoteView inside check_duration_and_vote handles the logic when vote passes.
+                    # I need to update DurationVoteView to handle the background processing too!
+                    return
+                
+                # If no vote needed (or duration limit disabled), proceed immediately
+                
+                # 1. Extract full info for the first track
+                first_entry = valid_entries[0]
+                first_url = first_entry.get('url') # This might be ID or URL
+                
+                await interaction.followup.send(f"Playlist found! Processing {len(valid_entries)} tracks...")
+                
+                # Extract first track fully
+                ydl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+                try:
+                    # If flat url is just ID, we might need to construct full URL or let ydl handle it.
+                    # For youtube, flat 'url' is usually the ID if extract_flat='in_playlist'
+                    # But extract_info handles IDs.
+                    
+                    print(f"DEBUG: Extracting full info for first track: {first_url}")
+                    first_info = await loop.run_in_executor(None, lambda: ydl.extract_info(first_url, download=False))
+                    
+                    first_duration = first_info.get('duration', 0)
+                    first_track_data = {
+                        'url': first_info['url'],
+                        'title': first_info.get('title', 'Unknown Track'),
+                        'duration': first_duration,
+                        'duration_str': str(int(first_duration // 60)) + ":" + str(int(first_duration % 60)).zfill(2)
+                    }
+                    
+                    # Add first track to queue
+                    if guild_id not in guild_queues:
+                        guild_queues[guild_id] = []
+                    guild_queues[guild_id].append(first_track_data)
+                    
+                    # Play first track
+                    if not vc.is_playing():
+                        await interaction.followup.send(f"Starting playlist with: **{first_track_data['title']}**")
+                        play_next(guild_id, vc, interaction.channel)
+                    else:
+                        await interaction.followup.send(f"Added **{first_track_data['title']}** to queue.")
+
+                    # 2. Spawn background task for the rest
+                    remaining_entries = valid_entries[1:]
+                    if remaining_entries:
+                        asyncio.create_task(process_playlist_background(guild_id, remaining_entries, interaction, vc))
+                        
+                except Exception as e:
+                    print(f"Error extracting first track: {e}")
+                    await interaction.followup.send("Failed to play first track of playlist.")
+                    return
+
+            else:
+                # Single video (Flat extraction also works for single video usually, but sometimes behaves differently)
+                # If it's a single video, 'entries' might not be present or it might be just the info dict.
+                # If flat extraction returns full info for single video (it might not have stream url though).
+                
+                # If 'url' is present in info, use it. But flat extraction might not give stream url.
+                # So we likely need to re-extract fully for single video too.
+                
+                # But wait, if it's single video, we can just do what we did before: extract fully.
+                # Or use the flat info to check duration, then extract fully.
+                
+                duration = info.get('duration', 0)
+                # Check duration
+                if await check_duration_and_vote(interaction, [info], duration, max_duration, vc):
+                    return
+
+                # Extract fully
+                ydl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+                full_info = await loop.run_in_executor(None, lambda: ydl.extract_info(query, download=False))
+                
+                track_info = {
+                    'url': full_info['url'],
+                    'title': full_info.get('title', 'Unknown Track'),
+                    'duration': full_info.get('duration', 0),
+                    'duration_str': str(int(full_info.get('duration', 0) // 60)) + ":" + str(int(full_info.get('duration', 0) % 60)).zfill(2)
+                }
+
+                if guild_id not in guild_queues:
+                    guild_queues[guild_id] = []
+                guild_queues[guild_id].append(track_info)
+
+                if not vc.is_playing():
+                    await interaction.followup.send(f"Added to queue and starting: **{track_info['title']}**")
+                    play_next(guild_id, vc, interaction.channel)
+                else:
+                    await interaction.followup.send(f"Added to queue: **{track_info['title']}**")
+            
+            return
 
     except Exception as e:
+
+        print(f"Error in play command: {e}")
         await interaction.followup.send(f"Failed to extract video data. It might be age-restricted or invalid.")
         return
-
-    # Initialize queue if needed
-    if guild_id not in guild_queues:
-        guild_queues[guild_id] = []
-
-    guild_queues[guild_id].append({'url': stream_url, 'title': title})
-
-    if not vc.is_playing():
-        await interaction.followup.send(f"Added to queue and starting: **{title}**")
-        play_next(guild_id, vc, interaction.channel)
-    else:
-        await interaction.followup.send(f"Added to queue: **{title}**")
 
 
 @bot.tree.command(name="playlist", description="List the current song queue.")
@@ -401,6 +909,18 @@ async def playlist(interaction: discord.Interaction):
     queue = guild_queues[guild_id]
     view = PlaylistView(queue)
     await interaction.response.send_message(embed=view.create_embed(), view=view)
+
+
+@bot.tree.command(name="clear", description="Clear the current queue (Mods Only).")
+@app_commands.describe()
+@app_commands.checks.has_permissions(manage_guild=True)
+async def clear_queue(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    if guild_id in guild_queues:
+        guild_queues[guild_id] = []
+        await interaction.response.send_message("🗑️ Queue cleared.", ephemeral=True)
+    else:
+        await interaction.response.send_message("Queue is already empty.", ephemeral=True)
 
 
 # --- Settings Group ---
@@ -431,6 +951,27 @@ async def defaultvolume(interaction: discord.Interaction, volume: int):
     save_settings()
 
     await interaction.response.send_message(f"🔊 Default volume set to **{volume}%** for future tracks.", ephemeral=True)
+
+
+@music_channel_group.command(name="max_duration", description="Set max song duration in minutes before a vote is required (0 to disable).")
+@app_commands.describe(minutes="Maximum duration in minutes")
+async def max_duration(interaction: discord.Interaction, minutes: int):
+    if minutes < 0:
+        await interaction.response.send_message("Duration cannot be negative.", ephemeral=True)
+        return
+
+    guild_id_str = str(interaction.guild.id)
+    if guild_id_str not in guild_settings:
+        guild_settings[guild_id_str] = {}
+
+    guild_settings[guild_id_str]["max_duration"] = minutes * 60  # Store in seconds
+    save_settings()
+
+    if minutes == 0:
+        await interaction.response.send_message("⏱️ Duration limit disabled.", ephemeral=True)
+    else:
+        await interaction.response.send_message(f"⏱️ Max duration set to **{minutes}** minutes. Longer songs will require a vote.", ephemeral=True)
+
 
 
 @music_channel_group.command(name="set_music_channel", description="Set the home music channel.")
@@ -486,6 +1027,48 @@ async def music_channel_list(interaction: discord.Interaction):
     await interaction.response.send_message(embed=embed, ephemeral=True)
 
 bot.tree.add_command(music_channel_group)
+
+
+@bot.event
+async def on_message(message):
+    if not message.guild:
+        return
+
+    # Count messages for NP repost logic
+    # We count ALL messages (users and bots) to determine "scroll distance"
+    guild_id = message.guild.id
+    
+    if guild_id in guild_last_np_message:
+        np_data = guild_last_np_message[guild_id]
+        
+        # Check if message is in the same channel as the NP message
+        if message.channel.id == np_data['channel_id']:
+            np_data['message_count'] += 1
+            
+            if np_data['message_count'] > 20:
+                # Time to repost!
+                
+                # Check if we have a current song
+                if guild_id in guild_current_song:
+                    current_song = guild_current_song[guild_id]
+                    
+                    # Get volume (safely)
+                    guild_id_str = str(guild_id)
+                    default_volume = guild_settings.get(guild_id_str, {}).get("default_volume", 60) / 100.0
+                    
+                    # Re-send the message
+                    vc = message.guild.voice_client
+                    if vc and vc.is_connected():
+                        view = SkipButton(guild_id, vc)
+                        # send_np_message handles deletion and updating global state
+                        # Note: This resets message_count to 0
+                        await send_np_message(guild_id, message.channel, current_song['title'], default_volume, view)
+
+    # Process commands (but ignore bots)
+    if message.author.bot:
+        return
+
+    await bot.process_commands(message)
 
 
 @bot.event

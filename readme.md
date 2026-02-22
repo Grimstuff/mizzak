@@ -1,5 +1,4 @@
-- Make admin commands secret
-- playlists
+- fix skip vote
 - spotify
 - avatar
 - move configs to config folder, individualized files

@@ -270,20 +270,21 @@ async def playlist(interaction: discord.Interaction):
     await interaction.response.send_message(embed=view.create_embed(), view=view)
 
 
-@bot.tree.command(name="skippercent", description="Set the percentage of users required to skip (1-100).")
-@app_commands.default_permissions(manage_guild=True)
+# --- Settings Group ---
+music_channel_group = app_commands.Group(name="settings", description="Manage bot settings (Mods Only).", default_permissions=discord.Permissions(manage_guild=True))
+
+@music_channel_group.command(name="skip_percent", description="Set the percentage of users required to skip (1-100).")
 async def skippercent(interaction: discord.Interaction, percent: int):
     if percent < 1 or percent > 100:
         await interaction.response.send_message("Please provide a number between 1 and 100.", ephemeral=True)
         return
 
     guild_skip_percents[interaction.guild.id] = percent / 100.0
-    await interaction.response.send_message(f"Skip requirement updated to **{percent}%** of the voice channel.")
+    await interaction.response.send_message(f"Skip requirement updated to **{percent}%** of the voice channel.", ephemeral=True)
 
 
-@bot.tree.command(name="defaultvolume", description="Set the default volume for music playback (1-200%).")
+@music_channel_group.command(name="default_volume", description="Set the default volume for music playback (1-200%).")
 @app_commands.describe(volume="Volume percentage (1-200)")
-@app_commands.default_permissions(manage_guild=True)
 async def defaultvolume(interaction: discord.Interaction, volume: int):
     if volume < 1 or volume > 200:
         await interaction.response.send_message("Please provide a volume between 1 and 200.", ephemeral=True)
@@ -296,13 +297,10 @@ async def defaultvolume(interaction: discord.Interaction, volume: int):
     guild_settings[guild_id_str]["default_volume"] = volume
     save_settings()
 
-    await interaction.response.send_message(f"🔊 Default volume set to **{volume}%** for future tracks.")
+    await interaction.response.send_message(f"🔊 Default volume set to **{volume}%** for future tracks.", ephemeral=True)
 
 
-# --- Music Channel Settings ---
-music_channel_group = app_commands.Group(name="musicchannel", description="Manage the home music channel.", default_permissions=discord.Permissions(manage_guild=True))
-
-@music_channel_group.command(name="set", description="Set the home music channel.")
+@music_channel_group.command(name="set_music_channel", description="Set the home music channel.")
 @app_commands.describe(channel="The voice channel to set as home.")
 async def music_channel_set(interaction: discord.Interaction, channel: discord.VoiceChannel):
     guild_id_str = str(interaction.guild.id)
@@ -312,19 +310,19 @@ async def music_channel_set(interaction: discord.Interaction, channel: discord.V
     guild_settings[guild_id_str]["music_channel_id"] = channel.id
     save_settings()
     
-    await interaction.response.send_message(f"✅ Home music channel set to **{channel.name}**.")
+    await interaction.response.send_message(f"✅ Home music channel set to **{channel.name}**.", ephemeral=True)
 
-@music_channel_group.command(name="clear", description="Clear the home music channel setting.")
+@music_channel_group.command(name="clear_music_channel", description="Clear the home music channel setting.")
 async def music_channel_clear(interaction: discord.Interaction):
     guild_id_str = str(interaction.guild.id)
     if guild_id_str in guild_settings and "music_channel_id" in guild_settings[guild_id_str]:
         del guild_settings[guild_id_str]["music_channel_id"]
         save_settings()
-        await interaction.response.send_message("🗑️ Home music channel setting cleared.")
+        await interaction.response.send_message("🗑️ Home music channel setting cleared.", ephemeral=True)
     else:
         await interaction.response.send_message("ℹ️ No home music channel was set.", ephemeral=True)
 
-@music_channel_group.command(name="list", description="List available voice channels and the current home channel.")
+@music_channel_group.command(name="list_music_channels", description="List available voice channels and the current home channel.")
 async def music_channel_list(interaction: discord.Interaction):
     guild_id_str = str(interaction.guild.id)
     current_channel_id = guild_settings.get(guild_id_str, {}).get("music_channel_id")
@@ -352,7 +350,7 @@ async def music_channel_list(interaction: discord.Interaction):
     if current_channel_id and not found_current:
         embed.set_footer(text="⚠️ The set home channel no longer exists!")
         
-    await interaction.response.send_message(embed=embed)
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 bot.tree.add_command(music_channel_group)
 

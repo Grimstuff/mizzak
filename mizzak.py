@@ -466,14 +466,50 @@ def check_confidence(query, title):
     matcher = difflib.SequenceMatcher(None, query, title)
     return matcher.ratio()
 
-async def update_voice_status(channel, status):
-    """Updates the voice channel status safely."""
+async def update_voice_status(channel, status, guild_id=None):
+    """Updates the voice channel status safely. If clearing (status=None), only clears if we set it."""
     if channel and channel.permissions_for(channel.guild.me).manage_channels:
         try:
-            # Discord has a limit, let's say 100 to be safe and readable
-            if status and len(status) > 100:
-                status = status[:97] + "..."
-            await channel.edit(status=status)
+            # Check if we should update. Use getattr to avoid AttributeError
+            current_status = getattr(channel, 'status', None)
+            
+            # Treat an empty string or None as having no status
+            has_no_status = current_status is None or current_status == ""
+
+            if status is None:
+                # We are attempting to clear the status.
+                # Only clear it if the current status matches the song we were playing.
+                # This prevents clearing custom statuses like "Watching Matrix" when we leave/skip.
+                expected_status = None
+                if guild_id and guild_id in guild_current_song:
+                    song_title = guild_current_song[guild_id]['title']
+                    expected_status = f"🎶 {song_title}"
+                    if len(expected_status) > 100:
+                        expected_status = expected_status[:97] + "..."
+                        
+                # If we don't know the expected status (e.g. queue empty), or it matches, we clear.
+                # But to be completely safe from overwriting human statuses, we could strictly only clear if it matches.
+                # Since guild_id is provided when we can, let's only clear if it matches what we think we set,
+                # or if we are forced to (guild_id=None, but we should pass guild_id when clearing).
+                
+                # To be conservative: only clear if current_status matches our expected format
+                if current_status and expected_status and current_status == expected_status:
+                    await channel.edit(status=None)
+                elif current_status and expected_status is None:
+                    # If queue empty and we disconnect, we only clear if it starts with "🎶 " (our format)
+                    if current_status.startswith("🎶 "):
+                        await channel.edit(status=None)
+
+            else:
+                # We are attempting to set a new status.
+                # Discord has a limit, let's say 100 to be safe and readable
+                if len(status) > 100:
+                    status = status[:97] + "..."
+                    
+                # Only update status if it's currently empty
+                if has_no_status:
+                    await channel.edit(status=status)
+                    
         except Exception as e:
             print(f"Failed to update voice status: {e}")
 
@@ -535,7 +571,7 @@ def play_next(guild_id, vc, text_channel):
         asyncio.run_coroutine_threadsafe(coro, bot.loop)
 
         # Update Voice Channel Status
-        status_coro = update_voice_status(vc.channel, f"🎶 {next_song['title']}")
+        status_coro = update_voice_status(vc.channel, f"🎶 {next_song['title']}", guild_id)
         asyncio.run_coroutine_threadsafe(status_coro, bot.loop)
     else:
         # Queue is empty, leave channel
@@ -548,7 +584,7 @@ def play_next(guild_id, vc, text_channel):
         # Clear status before leaving (or just leave, status might persist but that's okay, maybe clear it?)
         # Actually better to clear it if we can, but disconnecting might clear it automatically or leave it. 
         # Let's try to clear it explicitly first.
-        status_coro = update_voice_status(vc.channel, None)
+        status_coro = update_voice_status(vc.channel, None, guild_id)
         asyncio.run_coroutine_threadsafe(status_coro, bot.loop)
 
         coro = vc.disconnect()
@@ -1079,6 +1115,17 @@ async def on_message(message):
 
 @bot.event
 async def on_voice_state_update(member, before, after):
+    # If the bot itself moved/joined a channel while playing
+    if member.id == bot.user.id and after.channel is not None:
+        guild_id = member.guild.id
+        if guild_id in guild_current_song:
+            # Re-apply status if bot joins/is dragged to a new channel
+            await update_voice_status(after.channel, f"🎶 {guild_current_song[guild_id]['title']}", guild_id)
+            
+            # Optionally clear status from previous channel if we moved
+            if before.channel is not None and before.channel.id != after.channel.id:
+                await update_voice_status(before.channel, None, guild_id)
+
     # Ignore bots
     if member.bot:
         return

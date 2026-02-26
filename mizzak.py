@@ -69,6 +69,7 @@ YTDL_OPTIONS = {
     'no_warnings': True,
     'ignoreerrors': True,
     'playlistend': 20,
+    'remote_components': ['ejs:github'],
 }
 
 YTDL_OPTIONS_FLAT = YTDL_OPTIONS.copy()
@@ -1034,6 +1035,10 @@ async def on_message(message):
     if not message.guild:
         return
 
+    # Ignore our own messages to prevent them from inflating the scroll distance count
+    if message.author.id == bot.user.id:
+        return
+
     # Count messages for NP repost logic
     # We count ALL messages (users and bots) to determine "scroll distance"
     guild_id = message.guild.id
@@ -1060,8 +1065,9 @@ async def on_message(message):
                     vc = message.guild.voice_client
                     if vc and vc.is_connected():
                         view = SkipButton(guild_id, vc)
+                        # Reset immediately to prevent concurrent duplicate posts
+                        np_data['message_count'] = 0
                         # send_np_message handles deletion and updating global state
-                        # Note: This resets message_count to 0
                         await send_np_message(guild_id, message.channel, current_song['title'], default_volume, view)
 
     # Process commands (but ignore bots)

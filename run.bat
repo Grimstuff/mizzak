@@ -24,6 +24,21 @@ if %errorlevel% neq 0 (
     pause >nul
 )
 
+:: Check for Deno (JavaScript runtime required by yt-dlp)
+if not exist "bin\deno.exe" (
+    echo ------------------------------------------------
+    echo Setting up Deno ^(JavaScript runtime for YouTube extraction^)...
+    if not exist "bin" mkdir bin
+    powershell -Command "Invoke-WebRequest -Uri 'https://github.com/denoland/deno/releases/latest/download/deno-x86_64-pc-windows-msvc.zip' -OutFile 'bin\deno.zip'"
+    powershell -Command "Expand-Archive -Path 'bin\deno.zip' -DestinationPath 'bin' -Force"
+    del "bin\deno.zip"
+    echo Deno setup complete!
+    echo ------------------------------------------------
+)
+
+:: Add bin folder to PATH for this session so yt-dlp can find deno (and ffmpeg if placed there)
+set PATH=%CD%\bin;%PATH%
+
 :: Check if bot script exists
 if not exist "%BOT_SCRIPT%" (
     echo Error: %BOT_SCRIPT% not found!

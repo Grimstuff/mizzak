@@ -1,7 +1,8 @@
 venv/
 configs/
 __pycache__/
+*.exe
+bin/deno.exe
 secrets.json
 config.json
 guild_settings.json
-TODO

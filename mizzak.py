@@ -82,6 +82,7 @@ guild_skip_votes = {}
 guild_skip_percents = {} # Default will be 0.25 (25%)
 guild_last_np_message = {} # {guild_id: {'message_id': int, 'channel_id': int, 'message_count': int}}
 guild_current_song = {} # {guild_id: current_song_dict}
+guild_manual_skip = {} # {guild_id: bool}
 
 class Bot(commands.Bot):
     def __init__(self):
@@ -139,6 +140,7 @@ class SkipButton(discord.ui.View):
 
         if current_votes >= required_votes:
             await interaction.response.send_message(f"⏭️ Skip vote passed ({current_votes}/{required_votes}). Skipping...")
+            guild_manual_skip[guild_id] = True
             vc.stop() # Triggers the 'after' callback in play_next()
         else:
             await interaction.response.send_message(f"Skip vote registered! ({current_votes}/{required_votes} needed)")
@@ -198,7 +200,14 @@ class TrackSelectionView(discord.ui.View):
         for i, entry in enumerate(entries[:5]):
             label = entry.get('title', 'Unknown Title')[:100]
             uploader = entry.get('uploader', 'Unknown Artist')
-            description = f"{uploader}"[:100]
+            
+            duration = entry.get('duration', 0)
+            if duration:
+                duration_str = f"{int(duration // 60)}:{int(duration % 60):02d}"
+                description = f"{uploader} • {duration_str}"[:100]
+            else:
+                description = f"{uploader}"[:100]
+                
             options.append(discord.SelectOption(label=label, description=description, value=str(i)))
 
         # Create the Select item dynamically and add it
@@ -350,7 +359,8 @@ class DurationVoteView(discord.ui.View):
                             'url': info['url'],
                             'title': info.get('title', 'Unknown Track'),
                             'duration': duration,
-                            'duration_str': str(int(duration // 60)) + ":" + str(int(duration % 60)).zfill(2)
+                            'duration_str': str(int(duration // 60)) + ":" + str(int(duration % 60)).zfill(2),
+                            'id': info.get('id')
                         }
                         guild_queues[self.guild_id].append(final_first_track)
                 except Exception as e:
@@ -388,7 +398,8 @@ class DurationVoteView(discord.ui.View):
                             'url': info['url'],
                             'title': info.get('title', 'Unknown Track'),
                             'duration': duration,
-                            'duration_str': str(int(duration // 60)) + ":" + str(int(duration % 60)).zfill(2)
+                            'duration_str': str(int(duration // 60)) + ":" + str(int(duration % 60)).zfill(2),
+                            'id': info.get('id')
                         }
                         guild_queues[self.guild_id].append(final_first_track)
                     except Exception as e:
@@ -466,53 +477,6 @@ def check_confidence(query, title):
     matcher = difflib.SequenceMatcher(None, query, title)
     return matcher.ratio()
 
-async def update_voice_status(channel, status, guild_id=None):
-    """Updates the voice channel status safely. If clearing (status=None), only clears if we set it."""
-    if channel and channel.permissions_for(channel.guild.me).manage_channels:
-        try:
-            # Check if we should update. Use getattr to avoid AttributeError
-            current_status = getattr(channel, 'status', None)
-            
-            # Treat an empty string or None as having no status
-            has_no_status = current_status is None or current_status == ""
-
-            if status is None:
-                # We are attempting to clear the status.
-                # Only clear it if the current status matches the song we were playing.
-                # This prevents clearing custom statuses like "Watching Matrix" when we leave/skip.
-                expected_status = None
-                if guild_id and guild_id in guild_current_song:
-                    song_title = guild_current_song[guild_id]['title']
-                    expected_status = f"🎶 {song_title}"
-                    if len(expected_status) > 100:
-                        expected_status = expected_status[:97] + "..."
-                        
-                # If we don't know the expected status (e.g. queue empty), or it matches, we clear.
-                # But to be completely safe from overwriting human statuses, we could strictly only clear if it matches.
-                # Since guild_id is provided when we can, let's only clear if it matches what we think we set,
-                # or if we are forced to (guild_id=None, but we should pass guild_id when clearing).
-                
-                # To be conservative: only clear if current_status matches our expected format
-                if current_status and expected_status and current_status == expected_status:
-                    await channel.edit(status=None)
-                elif current_status and expected_status is None:
-                    # If queue empty and we disconnect, we only clear if it starts with "🎶 " (our format)
-                    if current_status.startswith("🎶 "):
-                        await channel.edit(status=None)
-
-            else:
-                # We are attempting to set a new status.
-                # Discord has a limit, let's say 100 to be safe and readable
-                if len(status) > 100:
-                    status = status[:97] + "..."
-                    
-                # Only update status if it's currently empty
-                if has_no_status:
-                    await channel.edit(status=status)
-                    
-        except Exception as e:
-            print(f"Failed to update voice status: {e}")
-
 async def send_np_message(guild_id, channel, song_title, volume, view):
     # 1. Delete previous NP message if it exists
     if guild_id in guild_last_np_message:
@@ -544,7 +508,94 @@ async def send_np_message(guild_id, channel, song_title, volume, view):
         'message_count': 0
     }
 
+async def handle_autoplay(guild_id, vc, text_channel, last_song):
+    if not vc or not vc.is_connected():
+        return
+
+    video_id = last_song.get('id')
+    if not video_id:
+        await vc.disconnect()
+        return
+
+    mix_url = f"https://www.youtube.com/watch?v={video_id}&list=RD{video_id}"
+    
+    try:
+        indicator = await text_channel.send("📻 *Finding next recommended track...*")
+    except Exception:
+        indicator = None
+
+    ydl_flat = yt_dlp.YoutubeDL(YTDL_OPTIONS_FLAT)
+    loop = asyncio.get_event_loop()
+    
+    try:
+        info = await asyncio.wait_for(loop.run_in_executor(None, lambda: ydl_flat.extract_info(mix_url, download=False)), timeout=20.0)
+        
+        # Abort if kicked during fetch
+        if not vc or not vc.is_connected():
+            if indicator:
+                try: await indicator.delete()
+                except: pass
+            return
+
+        if 'entries' in info and len(info['entries']) > 1:
+            next_entry = None
+            for entry in info['entries']:
+                if not entry: continue
+                if entry.get('id') != video_id:
+                    next_entry = entry
+                    break
+            
+            if next_entry:
+                next_url = next_entry.get('url') or next_entry.get('id')
+                ydl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+                full_info = await asyncio.wait_for(loop.run_in_executor(None, lambda: ydl.extract_info(next_url, download=False)), timeout=20.0)
+                
+                # Abort if kicked during full extract
+                if not vc or not vc.is_connected():
+                    if indicator:
+                        try: await indicator.delete()
+                        except: pass
+                    return
+
+                duration = full_info.get('duration', 0)
+                track_info = {
+                    'url': full_info['url'],
+                    'title': full_info.get('title', 'Unknown Track'),
+                    'duration': duration,
+                    'duration_str': str(int(duration // 60)) + ":" + str(int(duration % 60)).zfill(2),
+                    'id': full_info.get('id')
+                }
+                
+                if guild_id not in guild_queues:
+                    guild_queues[guild_id] = []
+                    
+                guild_queues[guild_id].append(track_info)
+                
+                if indicator:
+                    await indicator.delete()
+                
+                bot.loop.call_soon_threadsafe(play_next, guild_id, vc, text_channel)
+                return
+    except Exception as e:
+        print(f"Error extracting autoplay mix: {e}")
+        
+    if indicator:
+        try:
+            await indicator.delete()
+        except:
+            pass
+            
+    if vc and vc.is_connected():
+        await vc.disconnect()
+
 def play_next(guild_id, vc, text_channel):
+    # Abort if the bot is no longer connected to voice
+    if not vc or not vc.is_connected():
+        return
+
+    # Check and reset manual skip flag
+    was_skipped = guild_manual_skip.pop(guild_id, False)
+
     # Reset skip votes for the new track
     guild_skip_votes[guild_id] = set()
 
@@ -569,23 +620,22 @@ def play_next(guild_id, vc, text_channel):
         view = SkipButton(guild_id, vc)
         coro = send_np_message(guild_id, text_channel, next_song['title'], default_volume, view)
         asyncio.run_coroutine_threadsafe(coro, bot.loop)
-
-        # Update Voice Channel Status
-        status_coro = update_voice_status(vc.channel, f"🎶 {next_song['title']}", guild_id)
-        asyncio.run_coroutine_threadsafe(status_coro, bot.loop)
     else:
+        guild_id_str = str(guild_id)
+        autoplay_enabled = guild_settings.get(guild_id_str, {}).get("autoplay", False)
+        
+        if autoplay_enabled and guild_id in guild_current_song and not was_skipped:
+            last_song = guild_current_song[guild_id]
+            coro = handle_autoplay(guild_id, vc, text_channel, last_song)
+            asyncio.run_coroutine_threadsafe(coro, bot.loop)
+            return
+
         # Queue is empty, leave channel
         # Clear current song and NP message tracking
         if guild_id in guild_current_song:
             del guild_current_song[guild_id]
         if guild_id in guild_last_np_message:
             del guild_last_np_message[guild_id]
-
-        # Clear status before leaving (or just leave, status might persist but that's okay, maybe clear it?)
-        # Actually better to clear it if we can, but disconnecting might clear it automatically or leave it. 
-        # Let's try to clear it explicitly first.
-        status_coro = update_voice_status(vc.channel, None, guild_id)
-        asyncio.run_coroutine_threadsafe(status_coro, bot.loop)
 
         coro = vc.disconnect()
         asyncio.run_coroutine_threadsafe(coro, bot.loop)
@@ -653,7 +703,8 @@ async def process_playlist_background(guild_id, entries, interaction, vc):
                 'url': info['url'], # Stream URL
                 'title': info.get('title', 'Unknown Track'),
                 'duration': duration,
-                'duration_str': duration_str
+                'duration_str': duration_str,
+                'id': info.get('id')
             }
 
             if guild_id not in guild_queues:
@@ -746,7 +797,8 @@ async def play(interaction: discord.Interaction, query: str):
                     'url': stream_url, 
                     'title': title, 
                     'duration': duration,
-                    'duration_str': duration_str
+                    'duration_str': duration_str,
+                    'id': first_result.get('id')
                 }
 
                 # Check duration limit
@@ -865,7 +917,8 @@ async def play(interaction: discord.Interaction, query: str):
                         'url': first_info['url'],
                         'title': first_info.get('title', 'Unknown Track'),
                         'duration': first_duration,
-                        'duration_str': str(int(first_duration // 60)) + ":" + str(int(first_duration % 60)).zfill(2)
+                        'duration_str': str(int(first_duration // 60)) + ":" + str(int(first_duration % 60)).zfill(2),
+                        'id': first_info.get('id')
                     }
                     
                     # Add first track to queue
@@ -914,7 +967,8 @@ async def play(interaction: discord.Interaction, query: str):
                     'url': full_info['url'],
                     'title': full_info.get('title', 'Unknown Track'),
                     'duration': full_info.get('duration', 0),
-                    'duration_str': str(int(full_info.get('duration', 0) // 60)) + ":" + str(int(full_info.get('duration', 0) % 60)).zfill(2)
+                    'duration_str': str(int(full_info.get('duration', 0) // 60)) + ":" + str(int(full_info.get('duration', 0) % 60)).zfill(2),
+                    'id': full_info.get('id')
                 }
 
                 if guild_id not in guild_queues:
@@ -988,6 +1042,20 @@ async def defaultvolume(interaction: discord.Interaction, volume: int):
     save_settings()
 
     await interaction.response.send_message(f"🔊 Default volume set to **{volume}%** for future tracks.", ephemeral=True)
+
+
+@music_channel_group.command(name="autoplay", description="Toggle endless YouTube autoplay radio when the queue finishes.")
+@app_commands.describe(enabled="True to enable autoplay, False to disable.")
+async def autoplay_toggle(interaction: discord.Interaction, enabled: bool):
+    guild_id_str = str(interaction.guild.id)
+    if guild_id_str not in guild_settings:
+        guild_settings[guild_id_str] = {}
+
+    guild_settings[guild_id_str]["autoplay"] = enabled
+    save_settings()
+
+    state = "enabled" if enabled else "disabled"
+    await interaction.response.send_message(f"📻 Autoplay radio is now **{state}** for this server.", ephemeral=True)
 
 
 @music_channel_group.command(name="max_duration", description="Set max song duration in minutes before a vote is required (0 to disable).")
@@ -1115,18 +1183,43 @@ async def on_message(message):
 
 @bot.event
 async def on_voice_state_update(member, before, after):
-    # If the bot itself moved/joined a channel while playing
-    if member.id == bot.user.id and after.channel is not None:
+    # If the bot itself moved or was kicked
+    if member.id == bot.user.id:
         guild_id = member.guild.id
-        if guild_id in guild_current_song:
-            # Re-apply status if bot joins/is dragged to a new channel
-            await update_voice_status(after.channel, f"🎶 {guild_current_song[guild_id]['title']}", guild_id)
-            
-            # Optionally clear status from previous channel if we moved
-            if before.channel is not None and before.channel.id != after.channel.id:
-                await update_voice_status(before.channel, None, guild_id)
+        
+        # Bot was disconnected/kicked
+        if after.channel is None:
+            if guild_id in guild_queues:
+                del guild_queues[guild_id]
+            if guild_id in guild_current_song:
+                del guild_current_song[guild_id]
+            if guild_id in guild_last_np_message:
+                del guild_last_np_message[guild_id]
+            if guild_id in guild_skip_votes:
+                del guild_skip_votes[guild_id]
+                
+            return
 
-    # Ignore bots
+    # Check if a human left a channel where the bot is currently in
+    if not member.bot and before.channel is not None:
+        vc = member.guild.voice_client
+        if vc and vc.is_connected() and before.channel.id == vc.channel.id:
+            # Count humans remaining in the bot's channel
+            humans_remaining = [m for m in vc.channel.members if not m.bot]
+            if len(humans_remaining) == 0:
+                # Start a task to check again in 30 seconds
+                async def check_empty_and_leave():
+                    await asyncio.sleep(30)
+                    if vc and vc.is_connected():
+                        humans_now = [m for m in vc.channel.members if not m.bot]
+                        if len(humans_now) == 0:
+                            guild_id = member.guild.id
+                            if guild_id in guild_queues: del guild_queues[guild_id]
+                            if guild_id in guild_current_song: del guild_current_song[guild_id]
+                            await vc.disconnect()
+                bot.loop.create_task(check_empty_and_leave())
+
+    # Ignore bots for the auto-join logic
     if member.bot:
         return
 

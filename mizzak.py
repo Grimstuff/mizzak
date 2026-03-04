@@ -223,17 +223,55 @@ class TrackSelectionView(discord.ui.View):
             url = selected_track.get('url')
             guild_id = interaction.guild.id
 
+            # We only have flat info from search, extract full info now
+            ydl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+            loop = asyncio.get_event_loop()
+            try:
+                info = await asyncio.wait_for(loop.run_in_executor(None, lambda: ydl.extract_info(url, download=False)), timeout=30.0)
+            except asyncio.TimeoutError:
+                await interaction.followup.send("⚠️ Extraction timed out.")
+                self.stop()
+                select.disabled = True
+                await self.interaction.edit_original_response(view=self)
+                return
+            except Exception as e:
+                print(f"Error extracting selected track: {e}")
+                await interaction.followup.send("⚠️ Failed to extract selected track.")
+                self.stop()
+                select.disabled = True
+                await self.interaction.edit_original_response(view=self)
+                return
+
+            duration = info.get('duration', 0)
+            track_info = {
+                'url': info.get('url'),
+                'title': info.get('title', title),
+                'duration': duration,
+                'duration_str': str(int(duration // 60)) + ":" + str(int(duration % 60)).zfill(2),
+                'id': info.get('id')
+            }
+
+            # Check duration limit
+            guild_id_str = str(guild_id)
+            max_duration = guild_settings.get(guild_id_str, {}).get("max_duration", 1800)
+
+            if await check_duration_and_vote(interaction, [track_info], duration, max_duration, self.vc):
+                self.stop()
+                select.disabled = True
+                await self.interaction.edit_original_response(view=self)
+                return
+
             # Initialize queue if needed
             if guild_id not in guild_queues:
                 guild_queues[guild_id] = []
 
-            guild_queues[guild_id].append({'url': url, 'title': title})
+            guild_queues[guild_id].append(track_info)
 
             if not self.vc.is_playing():
-                await interaction.followup.send(f"Selected and starting: **{title}**")
+                await interaction.followup.send(f"Selected and starting: **{track_info['title']}**")
                 play_next(guild_id, self.vc, interaction.channel)
             else:
-                await interaction.followup.send(f"Selected and added to queue: **{title}**")
+                await interaction.followup.send(f"Selected and added to queue: **{track_info['title']}**")
             
             # Stop the view to remove interaction
             self.stop()
@@ -762,15 +800,16 @@ async def play(interaction: discord.Interaction, query: str):
         await vc.move_to(channel)
 
     # Extract audio info in an executor to avoid blocking the bot's event loop
-    ydl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
     try:
         if not query.startswith('http'):
             # Use ytsearch5 to get up to 5 results for confidence checking
             search_query = f"ytsearch5:{query}"
             
+            # Use FLAT extraction for fast search
+            ydl_flat = yt_dlp.YoutubeDL(YTDL_OPTIONS_FLAT)
             loop = asyncio.get_event_loop()
             try:
-                info = await asyncio.wait_for(loop.run_in_executor(None, lambda: ydl.extract_info(search_query, download=False)), timeout=30.0)
+                info = await asyncio.wait_for(loop.run_in_executor(None, lambda: ydl_flat.extract_info(search_query, download=False)), timeout=30.0)
             except asyncio.TimeoutError:
                 await interaction.followup.send("⚠️ Search timed out. YouTube took too long to respond.")
                 return
@@ -788,9 +827,23 @@ async def play(interaction: discord.Interaction, query: str):
             
             # If confidence is high (> 0.6) or only 1 result, play immediately
             if confidence > 0.6 or len(entries) == 1:
-                stream_url = first_result['url']
-                title = first_title
-                duration = first_result.get('duration', 0)
+                flat_url = first_result.get('url') # likely just ID or short URL
+                
+                # Now we must extract fully to get stream URL
+                ydl = yt_dlp.YoutubeDL(YTDL_OPTIONS)
+                try:
+                    full_info = await asyncio.wait_for(loop.run_in_executor(None, lambda: ydl.extract_info(flat_url, download=False)), timeout=30.0)
+                except asyncio.TimeoutError:
+                    await interaction.followup.send("⚠️ Extraction timed out. YouTube took too long to respond.")
+                    return
+                except Exception as e:
+                    print(f"Error fully extracting high confidence track: {e}")
+                    await interaction.followup.send("⚠️ Failed to extract track data.")
+                    return
+
+                stream_url = full_info.get('url')
+                title = full_info.get('title', first_title)
+                duration = full_info.get('duration', 0)
                 duration_str = str(int(duration // 60)) + ":" + str(int(duration % 60)).zfill(2)
                 
                 track_info = {
@@ -798,7 +851,7 @@ async def play(interaction: discord.Interaction, query: str):
                     'title': title, 
                     'duration': duration,
                     'duration_str': duration_str,
-                    'id': first_result.get('id')
+                    'id': full_info.get('id')
                 }
 
                 # Check duration limit

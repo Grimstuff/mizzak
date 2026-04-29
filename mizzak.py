@@ -1344,10 +1344,35 @@ async def on_voice_state_update(member, before, after):
     if after.channel.id != music_channel_id:
         return
 
+    # Post welcome message if it's not the last message
+    welcome_message = "Hi I'm Mizzak, use /play to either play a youtube url or search for a song"
+    try:
+        last_message = None
+        async for msg in after.channel.history(limit=1):
+            last_message = msg
+            break
+            
+        if not (last_message and last_message.author.id == bot.user.id and last_message.content == welcome_message):
+            await after.channel.send(welcome_message)
+    except Exception as e:
+        print(f"Failed to post welcome message: {e}")
+
     # Check if the bot is already connected to a voice channel in this guild
     vc = member.guild.voice_client
     if vc and vc.is_connected():
-        return # Already connected somewhere
+        guild_id = member.guild.id
+        is_active = vc.is_playing() or vc.is_paused() or (guild_id in guild_queues and len(guild_queues[guild_id]) > 0)
+        
+        if is_active:
+            return # Don't steal the bot if it's actively playing or has items in queue
+            
+        if vc.channel.id != after.channel.id:
+            try:
+                await vc.move_to(after.channel)
+                print(f"Auto-moved to home channel: {after.channel.name} in {member.guild.name}")
+            except Exception as e:
+                print(f"Failed to auto-move to home channel: {e}")
+        return
         
     # Connect to the home channel
     try:

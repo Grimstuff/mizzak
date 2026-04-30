@@ -80,6 +80,7 @@ YTDL_OPTIONS_FLAT['extract_flat'] = 'in_playlist'
 # --- State Management (Per-Guild) ---
 guild_queues = {}
 guild_skip_votes = {}
+guild_stop_votes = {}
 guild_skip_percents = {} # Default will be 0.25 (25%)
 guild_last_np_message = {} # {guild_id: {'message_id': int, 'channel_id': int, 'message_count': int}}
 guild_current_song = {} # {guild_id: current_song_dict}
@@ -106,8 +107,15 @@ def calculate_required_votes(guild_id, vc):
     all_members = channel.members
     listeners = [m for m in all_members if not m.bot]
     
-    required_percent = guild_skip_percents.get(guild_id, 0.25)
-    required_votes = max(1, math.ceil(len(listeners) * required_percent))
+    guild_id_str = str(guild_id)
+    auto_vote_threshold = guild_settings.get(guild_id_str, {}).get("auto_vote_threshold", 3)
+    
+    if len(listeners) <= auto_vote_threshold:
+        required_votes = 1
+        required_percent = 0 # Only for debug logging
+    else:
+        required_percent = guild_skip_percents.get(guild_id, 0.25)
+        required_votes = max(1, math.ceil(len(listeners) * required_percent))
 
     print(f"\n--- VOTE MATH DEBUG (Guild: {guild_id}) ---")
     print(f"1. Channel Name: {channel.name} (ID: {channel.id})")
@@ -687,8 +695,9 @@ def play_next(guild_id, vc, text_channel):
     # Check and reset manual skip flag
     was_skipped = guild_manual_skip.pop(guild_id, False)
 
-    # Reset skip votes for the new track
+    # Reset skip and stop votes for the new track
     guild_skip_votes[guild_id] = set()
+    guild_stop_votes[guild_id] = set()
 
     if guild_id in guild_queues and len(guild_queues[guild_id]) > 0:
         next_song = guild_queues[guild_id].pop(0)
@@ -738,9 +747,19 @@ async def check_duration_and_vote(interaction, tracks, total_duration, max_durat
     Checks if the duration exceeds the limit and triggers a vote if necessary.
     Returns True if a vote was triggered (caller should return), False otherwise.
     """
+    guild_id = interaction.guild.id
+    guild_id_str = str(guild_id)
+    auto_vote_threshold = guild_settings.get(guild_id_str, {}).get("auto_vote_threshold", 3)
+    
+    channel = vc.channel if vc else None
+    if channel:
+        channel_obj = interaction.guild.get_channel(channel.id) or channel
+        listeners = [m for m in channel_obj.members if not m.bot]
+        if len(listeners) <= auto_vote_threshold:
+            return False # Auto-accept bypass
+
     if max_duration > 0 and total_duration > max_duration:
         # Calculate required votes
-        guild_id = interaction.guild.id
         required_votes = calculate_required_votes(guild_id, vc)
 
         print(f"DEBUG: Duration Vote Triggered")
@@ -1117,6 +1136,77 @@ async def clear_queue(interaction: discord.Interaction):
         await interaction.response.send_message("Queue is already empty.", ephemeral=True)
 
 
+@bot.tree.command(name="skip", description="Vote to skip the current song.")
+async def skip_command(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    vc = interaction.guild.voice_client
+    
+    if not vc or not vc.is_connected() or not vc.is_playing():
+        await interaction.response.send_message("Nothing is playing right now.", ephemeral=True)
+        return
+
+    # Ensure user is actually listening
+    if not interaction.user.voice or interaction.user.voice.channel != vc.channel:
+        await interaction.response.send_message("You must be in the voice channel to vote!", ephemeral=True)
+        return
+        
+    if guild_id not in guild_skip_votes:
+        guild_skip_votes[guild_id] = set()
+
+    if interaction.user.id in guild_skip_votes[guild_id]:
+        await interaction.response.send_message("You've already voted to skip this track.", ephemeral=True)
+        return
+
+    guild_skip_votes[guild_id].add(interaction.user.id)
+
+    required_votes = calculate_required_votes(guild_id, vc)
+    current_votes = len(guild_skip_votes[guild_id])
+
+    if current_votes >= required_votes:
+        guild_manual_skip[guild_id] = True
+        vc.stop()
+        await interaction.response.send_message(f"⏭️ Skip vote passed ({current_votes}/{required_votes}). Skipping...")
+    else:
+        await interaction.response.send_message(f"Skip vote registered! ({current_votes}/{required_votes} needed)")
+
+@bot.tree.command(name="stop", description="Vote to stop playback and clear the queue.")
+async def stop_command(interaction: discord.Interaction):
+    guild_id = interaction.guild.id
+    vc = interaction.guild.voice_client
+    
+    if not vc or not vc.is_connected():
+        await interaction.response.send_message("The bot is not connected to a voice channel.", ephemeral=True)
+        return
+
+    if not interaction.user.voice or interaction.user.voice.channel != vc.channel:
+        await interaction.response.send_message("You must be in the voice channel to vote!", ephemeral=True)
+        return
+
+    if guild_id not in guild_stop_votes:
+        guild_stop_votes[guild_id] = set()
+
+    if interaction.user.id in guild_stop_votes[guild_id]:
+        await interaction.response.send_message("You've already voted to stop.", ephemeral=True)
+        return
+
+    guild_stop_votes[guild_id].add(interaction.user.id)
+
+    required_votes = calculate_required_votes(guild_id, vc)
+    current_votes = len(guild_stop_votes[guild_id])
+
+    if current_votes >= required_votes:
+        # Stop playback and clear queue
+        if guild_id in guild_queues:
+            guild_queues[guild_id] = [] # clear queue
+        guild_manual_skip[guild_id] = True # Prevent autoplay
+        
+        vc.stop()
+        guild_stop_votes[guild_id] = set() # reset
+        await interaction.response.send_message(f"🛑 Stop vote passed ({current_votes}/{required_votes}). Stopping playback and clearing queue.")
+    else:
+        await interaction.response.send_message(f"Stop vote registered! ({current_votes}/{required_votes} needed)")
+
+
 # --- Settings Group ---
 music_channel_group = app_commands.Group(name="settings", description="Manage bot settings (Mods Only).", default_permissions=discord.Permissions(manage_guild=True))
 
@@ -1180,6 +1270,22 @@ async def max_duration(interaction: discord.Interaction, minutes: int):
     else:
         await interaction.response.send_message(f"⏱️ Max duration set to **{minutes}** minutes. Longer songs will require a vote.", ephemeral=True)
 
+
+@music_channel_group.command(name="auto_vote_threshold", description="Set user threshold for auto-passing votes (default 3).")
+@app_commands.describe(users="Number of users or fewer where votes auto-pass")
+async def auto_vote_threshold(interaction: discord.Interaction, users: int):
+    if users < 1:
+        await interaction.response.send_message("Please provide a number of at least 1.", ephemeral=True)
+        return
+
+    guild_id_str = str(interaction.guild.id)
+    if guild_id_str not in guild_settings:
+        guild_settings[guild_id_str] = {}
+
+    guild_settings[guild_id_str]["auto_vote_threshold"] = users
+    save_settings()
+
+    await interaction.response.send_message(f"✅ Auto-vote threshold set to **{users}**. With {users} or fewer listeners, actions will auto-pass.", ephemeral=True)
 
 
 @music_channel_group.command(name="set_music_channel", description="Set the home music channel.")
@@ -1301,8 +1407,24 @@ async def on_voice_state_update(member, before, after):
                 del guild_last_np_message[guild_id]
             if guild_id in guild_skip_votes:
                 del guild_skip_votes[guild_id]
+            if guild_id in guild_stop_votes:
+                del guild_stop_votes[guild_id]
                 
             return
+
+        # Bot joined or moved to a new channel
+        if after.channel is not None and (before.channel is None or before.channel.id != after.channel.id):
+            welcome_message = "Hi I'm Mizzak, use /play to either play a youtube url or search for a song"
+            try:
+                last_message = None
+                async for msg in after.channel.history(limit=1):
+                    last_message = msg
+                    break
+                    
+                if not (last_message and last_message.author.id == bot.user.id and last_message.content == welcome_message):
+                    await after.channel.send(welcome_message)
+            except Exception as e:
+                print(f"Failed to post welcome message: {e}")
 
     # Check if a human left a channel where the bot is currently in
     if not member.bot and before.channel is not None:
@@ -1343,19 +1465,6 @@ async def on_voice_state_update(member, before, after):
     # Check if the channel joined is the home channel
     if after.channel.id != music_channel_id:
         return
-
-    # Post welcome message if it's not the last message
-    welcome_message = "Hi I'm Mizzak, use /play to either play a youtube url or search for a song"
-    try:
-        last_message = None
-        async for msg in after.channel.history(limit=1):
-            last_message = msg
-            break
-            
-        if not (last_message and last_message.author.id == bot.user.id and last_message.content == welcome_message):
-            await after.channel.send(welcome_message)
-    except Exception as e:
-        print(f"Failed to post welcome message: {e}")
 
     # Check if the bot is already connected to a voice channel in this guild
     vc = member.guild.voice_client

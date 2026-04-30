@@ -1,5 +1,5 @@
 @echo off
-title Discord Music Bot Console
+title mizzak
 
 :: Change to the directory where the script is located
 pushd "%~dp0"
